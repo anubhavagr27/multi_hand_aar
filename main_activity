@@ -1,0 +1,277 @@
+package com.example.GameController;
+
+import android.graphics.SurfaceTexture;
+import android.graphics.Typeface;
+import android.os.Bundle;
+import android.util.Log;
+import android.util.Size;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.TextView;
+
+import androidx.appcompat.app.AppCompatActivity;
+
+import com.google.mediapipe.components.CameraHelper;
+import com.google.mediapipe.components.CameraXPreviewHelper;
+import com.google.mediapipe.components.ExternalTextureConverter;
+import com.google.mediapipe.components.FrameProcessor;
+import com.google.mediapipe.components.PermissionHelper;
+import com.google.mediapipe.formats.proto.LandmarkProto;
+import com.google.mediapipe.formats.proto.LandmarkProto.NormalizedLandmark;
+import com.google.mediapipe.formats.proto.LandmarkProto.NormalizedLandmarkList;
+import com.google.mediapipe.formats.proto.RectProto;
+import com.google.mediapipe.framework.AndroidAssetUtil;
+import com.google.mediapipe.framework.Packet;
+import com.google.mediapipe.framework.PacketCallback;
+import com.google.mediapipe.framework.PacketGetter;
+import com.google.mediapipe.glutil.EglManager;
+
+import java.util.List;
+
+import static java.lang.Math.abs;
+
+//import com.google.mediapipe.formats.proto.RectProto;
+//import com.google.mediapipe.formats.proto.RectProto;
+
+/**
+ * Main activity of MediaPipe example apps.
+ */
+public class MainActivity extends AppCompatActivity {
+    private static final String TAG = "MainActivity";
+    private static final String BINARY_GRAPH_NAME = "multi_hand_tracking_mobile_gpu.binarypb";
+    private static final String INPUT_VIDEO_STREAM_NAME = "input_video";
+    private static final String OUTPUT_VIDEO_STREAM_NAME = "output_video";
+    private static final String OUTPUT_HAND_RECT = "multi_hand_rects";
+    private static final CameraHelper.CameraFacing CAMERA_FACING = CameraHelper.CameraFacing.FRONT;
+    // Flips the camera-preview frames vertically before sending them into FrameProcessor to be
+    // processed in a MediaPipe graph, and flips the processed frames back when they are displayed.
+    // This is needed because OpenGL represents images assuming the image origin is at the bottom-left
+    // corner, whereas MediaPipe in general assumes the image origin is at top-left.
+    private static final boolean FLIP_FRAMES_VERTICALLY = true;
+
+    private TextView gesture;
+    private TextView moveGesture;
+
+    static {
+        // Load all native libraries needed by the app.
+        System.loadLibrary("mediapipe_jni");
+        System.loadLibrary("opencv_java3");
+    }
+
+    // {@link SurfaceTexture} where the camera-preview frames can be accessed.
+    private SurfaceTexture previewFrameTexture;
+    // {@link SurfaceView} that displays the camera-preview frames processed by a MediaPipe graph.
+    private SurfaceView previewDisplayView;
+    // Creates and manages an {@link EGLContext}.
+    private EglManager eglManager;
+    // Sends camera-preview frames into a MediaPipe graph for processing, and displays the processed
+    // frames onto a {@link Surface}.
+    private FrameProcessor processor;
+    // Converts the GL_TEXTURE_EXTERNAL_OES texture from Android camera into a regular texture to be
+    // consumed by {@link FrameProcessor} and the underlying MediaPipe graph.
+    private ExternalTextureConverter converter;
+    // Handles camera access via the {@link CameraX} Jetpack support library.
+    private CameraXPreviewHelper cameraHelper;
+    List<NormalizedLandmarkList> multiHandLandmarks;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+        previewDisplayView = new SurfaceView(this);
+        setupPreviewDisplayView();
+        gesture = findViewById(R.id.gesture);
+        moveGesture = findViewById(R.id.move_gesture);
+        // Initialize asset manager so that MediaPipe native libraries can access the app assets, e.g.,
+        // binary graphs.
+        AndroidAssetUtil.initializeNativeAssetManager(this);
+        eglManager = new EglManager(null);
+        processor =
+                new FrameProcessor(
+                        this,
+                        eglManager.getNativeContext(),
+                        BINARY_GRAPH_NAME,
+                        INPUT_VIDEO_STREAM_NAME,
+                        OUTPUT_VIDEO_STREAM_NAME);
+        processor.getVideoSurfaceOutput().setFlipY(FLIP_FRAMES_VERTICALLY);
+
+        processor.addPacketCallback(
+                OUTPUT_HAND_RECT
+                , new PacketCallback() {
+                    @Override
+                    public void process(Packet packet) {
+
+                        List<RectProto.NormalizedRect> normalizedRectsList = PacketGetter.getProtoVector(packet, RectProto.NormalizedRect.parser());
+
+                        try {
+                            runOnUiThread(new Runnable() {
+                                @Override
+                                public void run() {
+                                    moveGesture.setTypeface(Typeface.create("sans-serif-bold", Typeface.NORMAL));
+                                    moveGesture.setText(handGestureMoveCalculator(normalizedRectsList));
+                                }
+                            });
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                        }
+                    }
+                });
+        PermissionHelper.checkAndRequestCameraPermissions(this);
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        converter = new ExternalTextureConverter(eglManager.getContext());
+        converter.setFlipY(FLIP_FRAMES_VERTICALLY);
+        converter.setConsumer(processor);
+        if (PermissionHelper.cameraPermissionsGranted(this)) {
+            startCamera();
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        converter.close();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(
+            int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        PermissionHelper.onRequestPermissionsResult(requestCode, permissions, grantResults);
+    }
+
+    private void setupPreviewDisplayView() {
+        previewDisplayView.setVisibility(View.GONE);
+        ViewGroup viewGroup = findViewById(R.id.preview_display_layout);
+        viewGroup.addView(previewDisplayView);
+        previewDisplayView
+                .getHolder()
+                .addCallback(
+                        new SurfaceHolder.Callback() {
+                            @Override
+                            public void surfaceCreated(SurfaceHolder holder) {
+                                processor.getVideoSurfaceOutput().setSurface(holder.getSurface());
+                            }
+
+                            @Override
+                            public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+                                // (Re-)Compute the ideal size of the camera-preview display (the area that the
+                                // camera-preview frames get rendered onto, potentially with scaling and rotation)
+                                // based on the size of the SurfaceView that contains the display.
+                                Size viewSize = new Size(width, height);
+                                Size displaySize = cameraHelper.computeDisplaySizeFromViewSize(viewSize);
+                                // Connect the converter to the camera-preview frames as its input (via
+                                // previewFrameTexture), and configure the output width and height as the computed
+                                // display size.
+                                converter.setSurfaceTextureAndAttachToGLContext(
+                                        previewFrameTexture, displaySize.getWidth(), displaySize.getHeight());
+                            }
+
+                            @Override
+                            public void surfaceDestroyed(SurfaceHolder holder) {
+                                processor.getVideoSurfaceOutput().setSurface(null);
+                            }
+                        });
+    }
+
+    private void startCamera() {
+        cameraHelper = new CameraXPreviewHelper();
+        cameraHelper.setOnCameraStartedListener(
+                surfaceTexture -> {
+                    previewFrameTexture = surfaceTexture;
+                    // Make the display view visible to start showing the preview. This triggers the
+                    // SurfaceHolder.Callback added to (the holder of) previewDisplayView.
+                    previewDisplayView.setVisibility(View.VISIBLE);
+                });
+        cameraHelper.startCamera(this, CAMERA_FACING, /*surfaceTexture=*/ null);
+    }
+
+    float previousXCenter;
+    float previousYCenter;
+    float previousAngle; // angle between the hand and the x-axis. in radian
+    float previous_rectangle_width;
+    float previousRectangleHeight;
+    int frameCounter=1;
+
+    private String handGestureMoveCalculator(List<RectProto.NormalizedRect> normalizedRectList) {
+
+        RectProto.NormalizedRect normalizedRect = normalizedRectList.get(0);
+        float height = normalizedRect.getHeight();
+        float centerX = normalizedRect.getXCenter();
+        float centerY = normalizedRect.getYCenter();
+        frameCounter = (frameCounter+1)%4;
+        if (frameCounter%4==0 && previousXCenter != 0) {
+            double mouvementDistance = getEuclideanDistanceAB(centerX, centerY,
+                    previousXCenter, previousYCenter);
+            // LOG(INFO) << "Distance: " << mouvementDistance;
+
+            double mouvementDistanceFactor = 0.02; // only large mouvements will be recognized.
+
+            // the height is normed [0.0, 1.0] to the camera window height.
+            // so the mouvement (when the hand is near the camera) should be equivalent to the mouvement when the hand is far.
+            double mouvementDistanceThreshold = mouvementDistanceFactor * height;
+            if (mouvementDistance > mouvementDistanceThreshold) {
+                double angle = radianToDegree(getAngleABC(centerX, centerY,
+                        previousXCenter, previousYCenter, previousXCenter + 0.1,
+                        previousYCenter));
+                // LOG(INFO) << "Angle: " << angle;
+                if(centerX>previousXCenter && abs(centerX-previousXCenter)>=abs(centerY-previousYCenter))
+                    return  "Scrolling right";
+                if(centerX<previousXCenter && abs(centerX-previousXCenter)>=abs(centerY-previousYCenter))
+                    return  "Scrolling left";
+                if(centerY>previousYCenter && abs(centerX-previousXCenter)<=abs(centerY-previousYCenter))
+                    return  "Scrolling down";
+                if(centerY<previousYCenter && abs(centerX-previousXCenter)<=abs(centerY-previousYCenter))
+                    return  "Scrolling up";
+                if (angle >= -45 && angle < 45) {
+                    return "Scrolling right";
+                } else if (angle >= 45 && angle < 135) {
+                    return "Scrolling up";
+                } else if (angle >= 135 || angle < -135) {
+                    return "Scrolling left";
+                } else if (angle >= -135 && angle < -45) {
+                    return "Scrolling down";
+                }
+            }
+        }
+
+        previousXCenter = centerX;
+        previousYCenter = centerY;
+        return "";
+    }
+
+
+    boolean isThumbNearFirstFinger(LandmarkProto.NormalizedLandmark point1, LandmarkProto.NormalizedLandmark point2) {
+        double distance = getEuclideanDistanceAB(point1.getX(), point1.getY(), point2.getX(), point2.getY());
+        return distance < 0.1;
+    }
+
+    double getEuclideanDistanceAB(double a_x, double a_y, double b_x, double b_y) {
+        double dist = Math.pow(a_x - b_x, 2) + Math.pow(a_y - b_y, 2);
+        return Math.sqrt(dist);
+    }
+
+    double getAngleABC(double a_x, double a_y, double b_x, double b_y, double c_x, double c_y) {
+        double ab_x = b_x - a_x;// prv_x-curr_x
+        double ab_y = b_y - a_y;//prv_y-curr_y
+        double cb_x = b_x - c_x;//prv_x-prv1_x
+        double cb_y = b_y - c_y;//prv_y-prv1_y
+
+        double dot = (ab_x * cb_x + ab_y * cb_y);   // dot product
+        double cross = (ab_x * cb_y - ab_y * cb_x); // cross product
+
+        return Math.atan2(a_y-b_y,a_x-b_x);
+        /*double val = (b_y-a_y)/(b_x-a_x);
+        return Math.atan(val);*/
+    }
+
+    int radianToDegree(double radian) {
+        return (int) Math.floor(radian * 180. / Math.PI + 0.5);
+    }
+
+}
